@@ -130,6 +130,7 @@ impl<'a> ForgeProject<'a> {
                 invokable: entrypoint.invokable,
                 webtrigger: entrypoint.web_trigger,
                 admin: entrypoint.admin,
+                admin_only: entrypoint.admin_only,
             })
         }));
     }
