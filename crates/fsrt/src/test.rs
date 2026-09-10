@@ -2608,6 +2608,39 @@ const SET_SECRET_APP: &str = "// src/index.jsx
 
         // manifest.yaml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                function: main
+                title: admin
+            macro:
+              - key: basic-hello-world
+                function: main
+                title: basic
+            function:
+              - key: main
+                handler: index.run
+        app:
+            id: ari:cloud:ecosystem::app/07b89c0f-949a-4905-9de9-6c9521035986
+        permissions:
+            scopes: []";
+
+const SET_SECRET_ORDINARY_APP: &str = "// src/index.jsx
+        import ForgeUI, { render, Macro, Fragment, Text } from '@forge/ui';
+        import { storage } from '@forge/api';
+
+        function App() {
+            storage.setSecret('sharedSecret', 'hunter2');
+            return (
+                <Fragment>
+                <Text>Hello world!</Text>
+                </Fragment>
+            );
+        }
+
+        export const run = render(<Macro app={<App />} />);
+
+        // manifest.yaml
+        modules:
             macro:
               - key: basic-hello-world
                 function: main
@@ -2621,10 +2654,21 @@ const SET_SECRET_APP: &str = "// src/index.jsx
             scopes: []";
 
 #[test]
-fn set_secret_reachable_from_invokable_entrypoint() {
+fn set_secret_in_shared_admin_resolver_via_ui_kit() {
     let scan_result = scan_with_secret_storage(MockForgeProject::files_from_string(SET_SECRET_APP));
     assert!(scan_result.contains_secret_storage_vuln(1));
     assert!(scan_result.contains_vulns(1));
+}
+
+// A resolver exposed only by ordinary modules was never restricted to admins, so
+// there is no platform restriction for sharing to remove. The scan is scoped to
+// admin resolvers shared with another module, so this is not reported.
+#[test]
+fn set_secret_in_ordinary_module_is_not_reported() {
+    let scan_result =
+        scan_with_secret_storage(MockForgeProject::files_from_string(SET_SECRET_ORDINARY_APP));
+    assert!(scan_result.contains_secret_storage_vuln(0));
+    assert!(scan_result.contains_vulns(0));
 }
 
 // The scan must stay off unless the flag is passed.
@@ -2658,6 +2702,10 @@ fn multiple_secrets_in_one_function_are_reported_separately() {
 
         // manifest.yaml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                function: main
+                title: admin
             macro:
               - key: basic-hello-world
                 function: main
@@ -2705,6 +2753,10 @@ fn set_secret_in_helper_reached_from_entrypoint() {
 
         // manifest.yaml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                function: main
+                title: admin
             macro:
               - key: basic-hello-world
                 function: main
@@ -2763,7 +2815,7 @@ fn set_secret_is_not_authentication() {
 }
 
 #[test]
-fn get_secret_reachable_from_invokable_entrypoint() {
+fn get_secret_in_shared_admin_resolver() {
     let test_forge_project = MockForgeProject::files_from_string(
         "// src/index.jsx
         import ForgeUI, { render, Macro, Fragment, Text } from '@forge/ui';
@@ -2782,6 +2834,10 @@ fn get_secret_reachable_from_invokable_entrypoint() {
 
         // manifest.yaml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                function: main
+                title: admin
             macro:
               - key: basic-hello-world
                 function: main
@@ -2822,6 +2878,10 @@ fn set_secret_behind_authorize_is_not_reported() {
 
         // manifest.yaml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                function: main
+                title: admin
             macro:
               - key: basic-hello-world
                 function: main
@@ -2904,6 +2964,12 @@ fn set_secret_in_custom_ui_resolver() {
 
         // manifest.yml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                resource: main
+                resolver:
+                  function: resolver-fn
+                title: admin
             jira:issuePanel:
               - key: panel
                 resource: main
@@ -3053,9 +3119,12 @@ fn set_secret_in_shared_compass_admin_resolver() {
     assert!(scan_result.contains_secret_storage_vuln(1));
     assert!(scan_result.contains_vulns(1));
     assert!(
-        scan_result.into_vulns().iter().any(|vuln| vuln
-            .description()
-            .contains("registered by an admin page module and by a non-admin module")),
+        scan_result
+            .into_vulns()
+            .iter()
+            .any(|vuln| vuln.description().contains(
+                "an admin page module shares it with a module any authenticated user can reach"
+            )),
         "shared admin resolver finding did not explain the bypass"
     );
 }
@@ -3108,9 +3177,12 @@ fn set_secret_in_shared_admin_resolver() {
     // The finding has to explain the shared-resolver mechanism, not claim that
     // module placement is never an authorization boundary.
     assert!(
-        scan_result.into_vulns().iter().any(|vuln| vuln
-            .description()
-            .contains("registered by an admin page module and by a non-admin module")),
+        scan_result
+            .into_vulns()
+            .iter()
+            .any(|vuln| vuln.description().contains(
+                "an admin page module shares it with a module any authenticated user can reach"
+            )),
         "shared admin resolver finding did not explain the bypass"
     );
 }
@@ -3148,6 +3220,12 @@ fn shared_authorization_helper_clears_every_resolver_prop() {
 
         // manifest.yml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                resource: main
+                resolver:
+                  function: resolver-fn
+                title: admin
             jira:issuePanel:
               - key: panel
                 resource: main
@@ -3190,6 +3268,12 @@ fn shared_sink_helper_reported_for_every_resolver_prop() {
 
         // manifest.yml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                resource: main
+                resolver:
+                  function: resolver-fn
+                title: admin
             jira:issuePanel:
               - key: panel
                 resource: main
@@ -3275,6 +3359,10 @@ fn secret_storage_detected_on_kvs_and_default_import() {
 
         // manifest.yaml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                function: main
+                title: admin
             macro:
               - key: basic-hello-world
                 function: main
@@ -3306,6 +3394,10 @@ fn secret_storage_detected_on_kvs_and_default_import() {
 
         // manifest.yaml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                function: main
+                title: admin
             macro:
               - key: basic-hello-world
                 function: main
@@ -3337,6 +3429,10 @@ fn secret_storage_detected_on_kvs_and_default_import() {
 
         // manifest.yaml
         modules:
+            jira:adminPage:
+              - key: admin-page
+                function: main
+                title: admin
             macro:
               - key: basic-hello-world
                 function: main
