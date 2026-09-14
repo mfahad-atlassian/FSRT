@@ -836,16 +836,11 @@ impl ModuleKind {
     /// users, so the app is not expected to authorize the caller. Sharing such a
     /// resolver with any other module removes that restriction.
     pub fn is_platform_admin_gated(self) -> bool {
-        matches!(self, Self::JIRA_ADMIN_PAGE | Self::COMPASS_ADMIN_PAGE)
-    }
-
-    /// Admin-scoped surfaces that are *not* known to carry a platform-enforced
-    /// permission check on resolver invocation. They are treated as reachable by
-    /// any authenticated user, which is the conservative assumption.
-    pub fn is_admin_scoped(self) -> bool {
         matches!(
             self,
-            Self::JIRA_PROJECT_SETTINGS_PAGE
+            Self::JIRA_ADMIN_PAGE
+                | Self::COMPASS_ADMIN_PAGE
+                | Self::JIRA_PROJECT_SETTINGS_PAGE
                 | Self::CONFLUENCE_SPACE_SETTINGS
                 | Self::CONFLUENCE_GLOBAL_SETTINGS
         )
@@ -855,8 +850,19 @@ impl ModuleKind {
         self == Self::WEB_TRIGGER
     }
 
-    /// Reachable by any authenticated user who can use the app.
-    pub fn is_user_invokable(self) -> bool {
+    /// Contributes an entry point for the scanners to analyze.
+    ///
+    /// Deliberately *not* derived from admin gating: an admin or settings page
+    /// still renders UI and its function is still worth analyzing, and the set
+    /// of analyzed modules has to stay as it was or the other scanners silently
+    /// lose coverage. `jira:adminPage` is the one exception, excluded here as it
+    /// always has been.
+    pub fn is_entry_point(self) -> bool {
+        !self.is_web_trigger() && self != Self::JIRA_ADMIN_PAGE
+    }
+
+    /// Reachable by a user who holds no admin permission.
+    pub fn is_reachable_by_non_admin(self) -> bool {
         !self.is_platform_admin_gated() && !self.is_web_trigger()
     }
 }
@@ -913,12 +919,9 @@ pub struct Entrypoint<'a, S = Unresolved> {
 }
 
 impl<S> Entrypoint<'_, S> {
-    /// Exposed by at least one module any authenticated user can reach.
+    /// Exposed by at least one module that contributes an entry point.
     pub fn invokable(&self) -> bool {
-        self.modules
-            .iter()
-            .copied()
-            .any(ModuleKind::is_user_invokable)
+        self.modules.iter().copied().any(ModuleKind::is_entry_point)
     }
 
     pub fn web_trigger(&self) -> bool {
@@ -949,7 +952,7 @@ impl<S> Entrypoint<'_, S> {
                 .handler_modules
                 .iter()
                 .copied()
-                .any(ModuleKind::is_user_invokable)
+                .any(ModuleKind::is_reachable_by_non_admin)
     }
 
     /// The manifest keys of every module exposing this function's handler, for
@@ -1567,7 +1570,9 @@ mod tests {
         let entry = manifest.modules.into_analyzable_functions().next().unwrap();
 
         assert!(entry.platform_admin_gated());
-        assert!(!entry.invokable());
+        // Still analyzable: `compass:adminPage` has always contributed an entry
+        // point, and dropping it would silently cost the other scanners coverage.
+        assert!(entry.invokable());
         assert!(!entry.shared_admin_resolver());
     }
 
@@ -1631,6 +1636,51 @@ mod tests {
                 entry.function.key
             );
         }
+    }
+
+    // Settings surfaces carry the same platform restriction as admin pages, so a
+    // settings resolver shared with an ordinary module is the same exposure.
+    #[test]
+    fn test_settings_page_resolver_shared_with_other_module() {
+        let json = r#"{
+            "app": { "id": "my-app" },
+            "modules": {
+                "jira:projectSettingsPage": [
+                    { "key": "settings", "resolver": { "function": "resolver-fn" } }
+                ],
+                "jira:issuePanel": [
+                    { "key": "panel", "resolver": { "function": "resolver-fn" } }
+                ],
+                "function": [ { "key": "resolver-fn", "handler": "index.handler" } ]
+            }
+        }"#;
+        let manifest: ForgeManifest<'_> = serde_json::from_str(json).unwrap();
+        let entry = manifest.modules.into_analyzable_functions().next().unwrap();
+
+        assert!(entry.platform_admin_gated());
+        assert!(entry.shared_admin_resolver());
+    }
+
+    // A settings page on its own is platform-restricted, so it is not an exposure
+    // — but it must still be an entry point, or the other scanners lose coverage
+    // they have today.
+    #[test]
+    fn test_settings_page_only_is_an_entry_point_but_not_shared() {
+        let json = r#"{
+            "app": { "id": "my-app" },
+            "modules": {
+                "confluence:spaceSettings": [
+                    { "key": "settings", "resolver": { "function": "resolver-fn" } }
+                ],
+                "function": [ { "key": "resolver-fn", "handler": "index.handler" } ]
+            }
+        }"#;
+        let manifest: ForgeManifest<'_> = serde_json::from_str(json).unwrap();
+        let entry = manifest.modules.into_analyzable_functions().next().unwrap();
+
+        assert!(entry.invokable(), "settings pages must stay analyzable");
+        assert!(entry.platform_admin_gated());
+        assert!(!entry.shared_admin_resolver());
     }
 
     // Test to check if Rovo modules can be deserialized properly from a sample manifest file.
