@@ -3,6 +3,7 @@
 use serde::Serialize;
 
 use crate::answers::{self, AnsweredQuestion};
+use crate::code_analysis::CodeAnalysis;
 use crate::evidence::Basis;
 use crate::facts::ManifestFacts;
 use crate::flags::{self, Flag};
@@ -37,6 +38,10 @@ pub struct ApprovalTemplate {
     pub app_type: AppType,
     pub questionnaire_source: &'static str,
     pub manifest_path: String,
+    /// The scan the answers were informed by, if one was run. Recorded so a
+    /// reviewer can see which checkers were consulted, and which were not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_analysis: Option<CodeAnalysis>,
     pub coverage: Coverage,
     pub flags: Vec<Flag>,
     pub listing: Vec<ListingField>,
@@ -121,18 +126,24 @@ fn percentage(part: usize, whole: usize) -> f64 {
 }
 
 impl ApprovalTemplate {
-    /// Pre-fill a submission from a parsed manifest.
-    pub fn build(facts: &ManifestFacts, manifest_path: impl Into<String>) -> Self {
-        let questionnaire = answers::answer_forge_questionnaire(facts);
+    /// Pre-fill a submission from a parsed manifest, optionally informed by a
+    /// scan of the app's source.
+    pub fn build(
+        facts: &ManifestFacts,
+        code: Option<CodeAnalysis>,
+        manifest_path: impl Into<String>,
+    ) -> Self {
+        let questionnaire = answers::answer_forge_questionnaire(facts, code.as_ref());
         Self {
             schema_version: SCHEMA_VERSION,
             app_type: AppType::Forge,
             questionnaire_source: QUESTIONNAIRE_SOURCE,
             manifest_path: manifest_path.into(),
             coverage: Coverage::measure(&questionnaire),
-            flags: flags::check(facts),
+            flags: flags::check(facts, code.as_ref()),
             listing: listing::build(facts),
             questionnaire,
+            code_analysis: code,
             attestation: ATTESTATION,
         }
     }
@@ -140,10 +151,12 @@ impl ApprovalTemplate {
     /// Read a manifest and pre-fill a submission from it.
     pub fn from_manifest(
         source: &str,
+        code: Option<CodeAnalysis>,
         manifest_path: impl Into<String>,
     ) -> Result<Self, crate::facts::Error> {
         Ok(Self::build(
             &ManifestFacts::from_yaml(source)?,
+            code,
             manifest_path,
         ))
     }
@@ -171,13 +184,15 @@ impl ApprovalTemplate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_analysis::Checker;
+    use std::collections::BTreeSet;
 
     const VULNERABLE_APP: &str =
         include_str!("../../../test-apps/jira-damn-vulnerable-forge-app/manifest.yml");
     const BASIC_APP: &str = include_str!("../../../test-apps/basic/manifest.yml");
 
     fn template(source: &str) -> ApprovalTemplate {
-        ApprovalTemplate::from_manifest(source, "manifest.yml").expect("parses")
+        ApprovalTemplate::from_manifest(source, None, "manifest.yml").expect("parses")
     }
 
     fn answer(template: &ApprovalTemplate, id: &str) -> AnsweredQuestion {
@@ -381,6 +396,158 @@ modules:
         for answer in template.needs_confirmation() {
             assert_eq!(answer.basis, Basis::Heuristic, "question {}", answer.id);
         }
+    }
+
+    /// Every checker having run and found nothing.
+    fn clean_scan() -> CodeAnalysis {
+        CodeAnalysis::new(
+            BTreeSet::from([
+                Checker::Authorization,
+                Checker::Authentication,
+                Checker::HardcodedSecret,
+                Checker::AtlassianCredential,
+                Checker::LeastPrivilege,
+            ]),
+            Vec::new(),
+        )
+    }
+
+    fn scanned(source: &str, code: CodeAnalysis) -> ApprovalTemplate {
+        ApprovalTemplate::from_manifest(source, Some(code), "manifest.yml").expect("parses")
+    }
+
+    #[test]
+    fn a_clean_scan_resolves_the_code_questions() {
+        let template = scanned(VULNERABLE_APP, clean_scan());
+        for (id, expected) in [
+            ("3", AnswerValue::Yes),  // no authorization bypass found
+            ("4a", AnswerValue::Yes), // no unauthenticated web trigger found
+            ("5a", AnswerValue::No),  // conditions are not the only gate
+            ("7", AnswerValue::Yes),  // no unused declared scopes
+            ("11", AnswerValue::No),  // no Atlassian credentials in code
+            ("13", AnswerValue::No),  // no hardcoded secrets
+        ] {
+            let answer = answer(&template, id);
+            assert_eq!(answer.answer, expected, "question {id}");
+            // A clean scan is never proof, so it is never deterministic and
+            // always needs confirming.
+            assert_eq!(answer.basis, Basis::Heuristic, "question {id}");
+            assert!(answer.confirm_before_submitting, "question {id}");
+            assert!(!answer.trips_signal, "question {id}");
+        }
+    }
+
+    #[test]
+    fn scanning_raises_coverage_substantially() {
+        let manifest_only = template(VULNERABLE_APP).coverage;
+        let with_scan = scanned(VULNERABLE_APP, clean_scan()).coverage;
+
+        assert_eq!(manifest_only.requires_code_review, 11);
+        assert_eq!(with_scan.requires_code_review, 5);
+        assert!(
+            with_scan.percent_resolved > manifest_only.percent_resolved + 15.0,
+            "expected a large uplift, got {} -> {}",
+            manifest_only.percent_resolved,
+            with_scan.percent_resolved
+        );
+    }
+
+    #[test]
+    fn findings_flip_answers_and_trip_blocking_signals() {
+        let analysis = CodeAnalysis::from_findings(
+            BTreeSet::from([
+                Checker::Authorization,
+                Checker::Authentication,
+                Checker::HardcodedSecret,
+                Checker::LeastPrivilege,
+            ]),
+            [
+                (
+                    "Custom-Check-Authorization-99",
+                    "Authorization bypass detected through run in \"src/index.jsx\".",
+                ),
+                (
+                    "Custom-Check-Authentication-98",
+                    "Insufficient Authentication through webhook run in \"src/index.jsx\".",
+                ),
+                (
+                    "Custom-Check-Hardcoded-Secret-97",
+                    "Hardcoded secret found within codebase run in \"src/utils.js\".",
+                ),
+                (
+                    "Least-Privilege",
+                    "Unused permissions listed in manifest file.",
+                ),
+            ],
+        );
+        let template = scanned(VULNERABLE_APP, analysis);
+
+        // Q13 is Fail-signalled and Yes is the non-conforming answer.
+        let secrets = answer(&template, "13");
+        assert_eq!(secrets.answer, AnswerValue::Yes);
+        assert!(secrets.trips_signal);
+        assert_eq!(secrets.signal, ReviewSignal::Fail);
+        assert_eq!(secrets.evidence.len(), 1);
+        assert_eq!(
+            secrets.evidence[0].pointer,
+            "Custom-Check-Hardcoded-Secret-97"
+        );
+
+        // Q3 is Fail-signalled and No is the non-conforming answer.
+        let authz = answer(&template, "3");
+        assert_eq!(authz.answer, AnswerValue::No);
+        assert!(authz.trips_signal);
+
+        // Q5a: display conditions plus an authorization bypass implies the
+        // condition is the only gate.
+        assert_eq!(answer(&template, "5a").answer, AnswerValue::Yes);
+        assert!(answer(&template, "5a").trips_signal);
+
+        assert_eq!(answer(&template, "4a").answer, AnswerValue::No);
+        assert_eq!(answer(&template, "7").answer, AnswerValue::No);
+
+        // Two Fail-signalled questions now answered the wrong way.
+        assert_eq!(template.coverage.blocking_signals_tripped, 2);
+    }
+
+    #[test]
+    fn display_condition_correlation_needs_display_conditions() {
+        // The basic app declares none, so Q5a must not be answered from an
+        // authorization finding alone.
+        let analysis = CodeAnalysis::from_findings(
+            BTreeSet::from([Checker::Authorization]),
+            [("Custom-Check-Authorization-1", "bypass")],
+        );
+        let template = scanned(BASIC_APP, analysis);
+        // Q5 is No, so Q5a is not applicable rather than answered.
+        assert_eq!(answer(&template, "5a").answer, AnswerValue::NotApplicable);
+    }
+
+    #[test]
+    fn an_end_of_life_runtime_becomes_a_flag() {
+        let analysis = CodeAnalysis::from_findings(
+            BTreeSet::from([Checker::RuntimeVersion]),
+            [(
+                "Forge Runtime Version Policy Checker",
+                "The Forge app uses an end-of-life Node.js runtime.",
+            )],
+        );
+        assert!(
+            scanned(VULNERABLE_APP, analysis)
+                .flags
+                .iter()
+                .any(|flag| flag.id == "runtime.end_of_life")
+        );
+    }
+
+    #[test]
+    fn checkers_that_did_not_run_leave_questions_open() {
+        // Only the authentication checker ran, so only its question moves.
+        let partial = CodeAnalysis::new(BTreeSet::from([Checker::Authentication]), Vec::new());
+        let template = scanned(VULNERABLE_APP, partial);
+        assert_eq!(answer(&template, "4a").answer, AnswerValue::Yes);
+        assert_eq!(answer(&template, "13").answer, AnswerValue::Unknown);
+        assert_eq!(answer(&template, "13").basis, Basis::RequiresCodeReview);
     }
 
     #[test]

@@ -27,6 +27,7 @@
 //! is unanswerable here. The manifest facts are still attached as evidence so
 //! the partner answers with the relevant context in front of them.
 
+use crate::code_analysis::{Checker, CodeAnalysis, Verdict};
 use crate::evidence::{Basis, Evidence};
 use crate::facts::ManifestFacts;
 use crate::questionnaire::{
@@ -117,12 +118,15 @@ impl Determination {
 ///
 /// Questions are visited in published order so that a sub-question can see its
 /// parent's answer.
-pub fn answer_forge_questionnaire(facts: &ManifestFacts) -> Vec<AnsweredQuestion> {
+pub fn answer_forge_questionnaire(
+    facts: &ManifestFacts,
+    code: Option<&CodeAnalysis>,
+) -> Vec<AnsweredQuestion> {
     let mut answered: Vec<AnsweredQuestion> = Vec::new();
 
     for question in AppType::Forge.questions() {
         let (asked, determination) = match gate(question, &answered) {
-            Gate::Asked => (true, derive(question, facts)),
+            Gate::Asked => (true, derive(question, facts, code)),
             Gate::NotAsked { basis, reason } => (
                 false,
                 Determination::new(AnswerValue::NotApplicable, basis).because(reason),
@@ -197,7 +201,18 @@ fn gate(question: &Question, answered: &[AnsweredQuestion]) -> Gate {
 }
 
 /// The per-question derivation rules.
-fn derive(question: &Question, facts: &ManifestFacts) -> Determination {
+fn derive(
+    question: &Question,
+    facts: &ManifestFacts,
+    code: Option<&CodeAnalysis>,
+) -> Determination {
+    // A scan of the app's source answers several questions the manifest cannot.
+    // When no scan was run, or the relevant checker did not run, fall through to
+    // the manifest-only rules below.
+    if let Some(determination) = from_code_analysis(question, facts, code) {
+        return determination;
+    }
+
     match question.id {
         "1" => user_interactions(facts),
         "2" => forge_remote(facts),
@@ -265,6 +280,116 @@ fn derive(question: &Question, facts: &ManifestFacts) -> Determination {
 
         _ => Determination::needs_partner(default_partner_reason(question)),
     }
+}
+
+/// How a checker's verdict maps onto one question.
+struct CodeRule {
+    checker: Checker,
+    /// The answer a finding implies.
+    on_found: AnswerValue,
+    /// The answer a clean run implies.
+    on_clean: AnswerValue,
+    found_reason: &'static str,
+    clean_reason: &'static str,
+}
+
+/// Answer a question from static analysis, if a relevant checker ran.
+///
+/// Returns [`None`] when there was no scan, the relevant checker did not run, or
+/// the question has no mapping — in which case the manifest-only rules apply.
+fn from_code_analysis(
+    question: &Question,
+    facts: &ManifestFacts,
+    code: Option<&CodeAnalysis>,
+) -> Option<Determination> {
+    let code = code?;
+    let rule = code_rule(question.id, facts)?;
+
+    let (answer, reason) = match code.verdict(&rule.checker) {
+        Verdict::NotRun => return None,
+        Verdict::Found => (rule.on_found, rule.found_reason),
+        Verdict::Clean => (rule.on_clean, rule.clean_reason),
+    };
+
+    // Always heuristic. FSRT's analysis is neither sound nor complete, so neither
+    // a finding nor a clean run is proof, and the partner must confirm.
+    Some(
+        Determination::new(answer, Basis::Heuristic)
+            .because(reason)
+            .citing(code.findings_by(&rule.checker).map(|finding| {
+                Evidence::new(finding.check_name.clone(), finding.description.clone())
+            })),
+    )
+}
+
+fn code_rule(question_id: &str, facts: &ManifestFacts) -> Option<CodeRule> {
+    Some(match question_id {
+        // Q3 asks whether permissions are checked before privileged calls, which
+        // is exactly the bypass AuthZChecker looks for.
+        "3" => CodeRule {
+            checker: Checker::Authorization,
+            on_found: AnswerValue::No,
+            on_clean: AnswerValue::Yes,
+            found_reason: "FSRT's authorization scanner found a path reaching a privileged \
+                 call without an authorisation check.",
+            clean_reason: "FSRT's authorization scanner found no unauthorised path to a \
+                 privileged call. A clean scan is not a proof; confirm the app checks \
+                 permissions before acting as the app.",
+        },
+        "4a" => CodeRule {
+            checker: Checker::Authentication,
+            on_found: AnswerValue::No,
+            on_clean: AnswerValue::Yes,
+            found_reason: "FSRT's authentication scanner found a web trigger reaching an \
+                 API call without authenticating its caller.",
+            clean_reason: "FSRT's authentication scanner found no unauthenticated web \
+                 trigger path. A clean scan is not a proof; confirm each trigger \
+                 authenticates its caller.",
+        },
+        // Only meaningful when the app actually declares display conditions. An
+        // authorisation bypass in an app that gates modules by display condition
+        // is good evidence the condition is the only check.
+        "5a" if !facts.display_conditions.is_empty() => CodeRule {
+            checker: Checker::Authorization,
+            on_found: AnswerValue::Yes,
+            on_clean: AnswerValue::No,
+            found_reason: "The app gates modules with display conditions, and FSRT's \
+                 authorization scanner also found a path with no authorisation check \
+                 in code — so the display condition is likely the only gate.",
+            clean_reason: "The app gates modules with display conditions, and FSRT's \
+                 authorization scanner found no path lacking an authorisation check in \
+                 code.",
+        },
+        // PermissionChecker reports scopes declared in the manifest but never
+        // used, which is the concrete form of the least-privilege question.
+        "7" => CodeRule {
+            checker: Checker::LeastPrivilege,
+            on_found: AnswerValue::No,
+            on_clean: AnswerValue::Yes,
+            found_reason: "FSRT's least privilege scanner found scopes declared in the \
+                 manifest that the app never uses. Remove them, or justify each one.",
+            clean_reason: "FSRT's least privilege scanner found no declared scope that \
+                 the app never uses.",
+        },
+        "11" => CodeRule {
+            checker: Checker::AtlassianCredential,
+            on_found: AnswerValue::Yes,
+            on_clean: AnswerValue::No,
+            found_reason: "FSRT found an Atlassian API or container token used directly in \
+                 the app. This is a blocking finding.",
+            clean_reason: "FSRT found no direct use of an Atlassian API or container token.",
+        },
+        "13" => CodeRule {
+            checker: Checker::HardcodedSecret,
+            on_found: AnswerValue::Yes,
+            on_clean: AnswerValue::No,
+            found_reason: "FSRT's secret scanner found a hardcoded secret in the app. This \
+                 is a blocking finding.",
+            clean_reason: "FSRT's secret scanner found no hardcoded secret. It cannot see \
+                 secrets committed elsewhere in the repository's history.",
+        },
+        _ => return None,
+    })
 }
 
 fn default_partner_reason(question: &Question) -> &'static str {

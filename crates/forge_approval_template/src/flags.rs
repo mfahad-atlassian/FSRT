@@ -17,6 +17,7 @@
 
 use serde::Serialize;
 
+use crate::code_analysis::{Checker, CodeAnalysis};
 use crate::evidence::Evidence;
 use crate::facts::ManifestFacts;
 use crate::questionnaire::ReviewSignal;
@@ -76,14 +77,43 @@ const TRADEMARK_CRITERION: &str = "Doesn't infringe Atlassian trademarks: Tradem
      For example, Jira App X would be rejected, but App X for Jira would be approved.";
 
 /// Run every pre-submission check.
-pub fn check(facts: &ManifestFacts) -> Vec<Flag> {
+pub fn check(facts: &ManifestFacts, code: Option<&CodeAnalysis>) -> Vec<Flag> {
     let mut flags = Vec::new();
     flags.extend(check_app_name(facts));
     flags.extend(check_egress(facts));
     flags.extend(check_content_security(facts));
     flags.extend(check_remotes(facts));
+    flags.extend(check_runtime_version(code));
     flags.sort_by(|a, b| b.severity.cmp(&a.severity));
     flags
+}
+
+/// An end-of-life Node.js runtime is a listing risk in its own right, and is not
+/// covered by any questionnaire question.
+fn check_runtime_version(code: Option<&CodeAnalysis>) -> Vec<Flag> {
+    let evidence: Vec<Evidence> = code
+        .into_iter()
+        .flat_map(|code| code.findings_by(&Checker::RuntimeVersion))
+        .map(|finding| Evidence::new(finding.check_name.clone(), finding.description.clone()))
+        .collect();
+
+    if evidence.is_empty() {
+        return Vec::new();
+    }
+
+    Vec::from([Flag {
+        id: "runtime.end_of_life",
+        severity: ReviewSignal::Warning,
+        title: "App declares an end-of-life Node.js runtime",
+        detail: "FSRT's runtime scanner reports that `app.runtime.name` names a Node.js \
+                 version that is out of support. Move to a supported runtime before \
+                 submitting."
+            .to_string(),
+        source: FlagSource::ApprovalGuidelines {
+            criterion: "Fulfill the security requirements outlined in the security workflow",
+        },
+        evidence,
+    }])
 }
 
 fn check_app_name(facts: &ManifestFacts) -> Vec<Flag> {

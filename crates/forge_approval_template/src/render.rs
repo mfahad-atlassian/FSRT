@@ -243,7 +243,7 @@ mod tests {
 
     fn markdown() -> String {
         let template =
-            ApprovalTemplate::from_manifest(VULNERABLE_APP, "manifest.yml").expect("parses");
+            ApprovalTemplate::from_manifest(VULNERABLE_APP, None, "manifest.yml").expect("parses");
         to_markdown(&template)
     }
 
