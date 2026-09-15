@@ -966,6 +966,7 @@ dependencies = [
  "argfile",
  "clap",
  "forge_analyzer",
+ "forge_approval_template",
  "forge_file_resolver",
  "forge_loader",
  "forge_pen_test",
