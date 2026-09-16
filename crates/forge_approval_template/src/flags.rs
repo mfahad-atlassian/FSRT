@@ -84,7 +84,8 @@ pub fn check(facts: &ManifestFacts, code: Option<&CodeAnalysis>) -> Vec<Flag> {
     flags.extend(check_content_security(facts));
     flags.extend(check_remotes(facts));
     flags.extend(check_runtime_version(code));
-    flags.sort_by(|a, b| b.severity.cmp(&a.severity));
+    // Most severe first, so a blocking flag is never buried under advice.
+    flags.sort_by_key(|flag| std::cmp::Reverse(flag.severity));
     flags
 }
 
